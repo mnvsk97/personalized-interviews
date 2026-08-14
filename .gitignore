@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+dist/
+coverage/
+.superdesign/
+.DS_Store
+tsconfig.tsbuildinfo
+data/*.db
+data/*.db-shm
+data/*.db-wal
