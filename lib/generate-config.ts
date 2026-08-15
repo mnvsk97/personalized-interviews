@@ -10,13 +10,14 @@ const schemas = {
 Saving confirmed answers is required, not optional:
 - After each substantive intake answer, naturally reflect the value back and ask whether you understood it correctly.
 - Wait for the participant's confirmation. Immediately call save_interview_answer with the matching stable key, exact value, and confirmed true before moving to the next intake topic.
-- If the participant corrects the value, use the correction. If they decline to confirm, do not save it.
-- Wait for the tool result before continuing, and never repeat a successful save.
+- A correction replaces the prior value. Repeat only the corrected value, ask for confirmation, and immediately save the correction after confirmation.
+- Do not continue until the save tool succeeds. Never preserve both the old and corrected value as current, and never repeat a successful save.
+- If the participant declines to confirm, do not save the value.
 
 Call request_human_callback when requested or when the participant is distressed. Near the end, recap the collected information, confirm corrections, and call complete_prescreen with a workflow outcome, unanswered questions, and next steps. Completing the intake does not end the call: thank the participant, remain present, and wait for them to leave.` },
     casting: { faceProfile: "warm professional woman", voiceProfile: "calm supportive", language: "English", pace: "measured" },
     personalization: { summary: "", knownFacts: [], locationContext: "", conversationWarmers: [], currentSessionFocus: [], priorSessionUse: "" },
-    objectives: ["Collect and confirm required prescreen answers", "Explain next steps without making medical or legal claims", "Complete the prescreen or arrange a human callback"],
+    objectives: ["Confirm the participant's first substantive answer or correction and invoke save_interview_answer before continuing", "Explain next steps without making medical or legal claims", "Complete the prescreen or arrange a human callback"],
     guardrails: ["Never provide medical or legal advice", "Never guarantee eligibility, matching, compensation, or outcomes", "Ask permission before sensitive health questions", "Save only answers the participant has confirmed", "Escalate distress, coercion, emergencies, or requests for a person", "Do not request SSNs, payment details, medical records, or government ID"],
   },
   hcp: {
@@ -234,7 +235,9 @@ ${JSON.stringify({ experience, currentProfile: safeProfile, previousSession: pri
     },
     casting: personalized.casting,
     personalization: personalized.conversation,
-    objectives: [...new Set([...personalized.objectives.slice(0, 2), ...fixed.objectives])],
+    objectives: [...new Set(experience === "surrogacy"
+      ? [...fixed.objectives, ...personalized.objectives.slice(0, 2)]
+      : [...personalized.objectives.slice(0, 2), ...fixed.objectives])],
     guardrails: [...fixed.guardrails],
   };
 }

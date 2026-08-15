@@ -147,11 +147,13 @@ export function createApp(dependencies: {
   configGenerator?: typeof generateConfig;
   tavusSessionCreator?: typeof createTavusSession;
   tavusSessionEnder?: typeof endTavusSession;
+  surrogacyReportGenerator?: typeof generateSurrogacyReport;
 } = {}) {
   const app = express();
   const configGenerator = dependencies.configGenerator || generateConfig;
   const tavusSessionCreator = dependencies.tavusSessionCreator || createTavusSession;
   const tavusSessionEnder = dependencies.tavusSessionEnder || endTavusSession;
+  const surrogacyReportGenerator = dependencies.surrogacyReportGenerator || generateSurrogacyReport;
   app.use(express.json({ limit: "1mb" }));
 
   app.post("/api/sessions", async (req, res) => {
@@ -210,7 +212,8 @@ export function createApp(dependencies: {
     try {
       if (session.experience === "surrogacy") {
         const latest = getSession(session.id) || session;
-        const report = await generateSurrogacyReport(latest.profile, transcript, latest.answers);
+        const report = await surrogacyReportGenerator(latest.profile, transcript, latest.answers);
+        for (const correction of report.confirmedCorrections) saveAnswer(session.id, correction.key, correction.value, true);
         const prior = Array.isArray(latest.result?.nextSteps) ? latest.result.nextSteps.filter((item): item is string => typeof item === "string") : [];
         const result = { ...latest.result, ...report, nextSteps: [...new Set([...prior, ...report.nextSteps])] };
         updateSession(session.id, { status: latest.status === "escalated" ? "escalated" : "completed", summary: report.summary, result: { ...result, nextSessionBrief: buildNextSessionBrief("surrogacy", report.summary, result) } });

@@ -7,7 +7,7 @@ import { createSession, getParticipantByEmail, getSession, resetDatabaseForTests
 import { generateConfig } from "../lib/generate-config";
 import type { OpenAIConfigClient } from "../lib/generate-config";
 import { normalizeCategoryScores } from "../lib/generate-hcp-report";
-import { buildFallbackSurrogacyReport } from "../lib/generate-surrogacy-report";
+import { applyConfirmedCorrections, buildFallbackSurrogacyReport, generateSurrogacyReport } from "../lib/generate-surrogacy-report";
 import { createTavusSession, endTavusSession, extractTranscript, memoryStoreForParticipant, resetTavusCacheForTests, syncTavusTools, toolSpecs } from "../lib/tavus";
 import type { GeneratedConfig } from "../lib/types";
 import { toolResultMessage } from "../src/TavusRoom";
@@ -136,6 +136,8 @@ describe("PAL configuration", () => {
     expect(greeting).toContain("How's California treating you today?");
     expect(response.body.session.config.personalization.knownFacts).toContain("Location: California");
     expect(response.body.session.config.pal.systemPrompt).toContain("Wait for the participant's confirmation");
+    expect(response.body.session.config.pal.systemPrompt).toContain("A correction replaces the prior value");
+    expect(response.body.session.config.objectives[0]).toContain("save_interview_answer");
     expect(response.body.session.config.pal.systemPrompt).toContain("pregnancy and delivery history");
   });
 
@@ -325,6 +327,41 @@ describe("post-call reports", () => {
       expect.objectContaining({ label: "Age", value: "29 years", source: "intake_form" }),
       expect.objectContaining({ label: "Location", value: "San Francisco, California", source: "intake_form" }),
       expect.objectContaining({ label: "Support System", source: "confirmed_answer" }),
+    ]);
+  });
+
+  it("replaces an old intake value with one confirmed correction", () => {
+    const details = applyConfirmedCorrections([
+      { key: "intake_name", label: "Name", value: "Priya Sharma", evidence: "Provided before the conversation", source: "intake_form" },
+      { key: "intake_age", label: "Age", value: "33 years", evidence: "Provided before the conversation", source: "intake_form" },
+      { key: "transcript_detail_1", label: "Age", value: "25", evidence: "My age is 25", source: "transcript" },
+    ], [{ key: "age", value: "25", correctionEvidence: "My age is 25, not 33.", confirmationEvidence: "Yes." }]);
+
+    expect(details.filter(({ label }) => label === "Age")).toEqual([
+      expect.objectContaining({ key: "age", value: "25 years", source: "confirmed_answer", evidence: expect.stringContaining("Confirmed with: Yes.") }),
+    ]);
+  });
+
+  it("persists a transcript-confirmed correction for the next session", async () => {
+    await seed("surrogacy");
+    updateSession(id, { status: "active", conversationId: "conv-1", palId: "pal-1", objectivesId: "objectives-1" });
+    const surrogacyReportGenerator: typeof generateSurrogacyReport = async () => ({
+      summary: "Candidate corrected her age to 25.",
+      capturedDetails: [{ key: "age", label: "Age", value: "25 years", evidence: "My age is 25. Confirmed with: Yes.", source: "confirmed_answer" }],
+      conversationHighlights: ["Age corrected to 25"],
+      unansweredQuestions: [],
+      nextSteps: [],
+      confirmedCorrections: [{ key: "age", value: "25", correctionEvidence: "My age is 25, not 33.", confirmationEvidence: "Yes." }],
+      reportSource: "post_call_transcript",
+    });
+    const tavusSessionEnder = vi.fn(async () => []);
+    const api = request(createApp({ configGenerator: fakeGenerateConfig, tavusSessionEnder, surrogacyReportGenerator }));
+
+    await api.delete(`/api/sessions/${id}/conversation`).send({ conversationId: "conv-1" }).expect(200);
+
+    expect(getSession(id)?.answers).toContainEqual({ key: "age", value: "25", confirmed: true });
+    expect(getSession(id)?.result?.capturedDetails).toEqual([
+      expect.objectContaining({ key: "age", value: "25 years", source: "confirmed_answer" }),
     ]);
   });
 });
