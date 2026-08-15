@@ -23,6 +23,8 @@ Two personalized conversation demos built with Tavus CVI:
 
 React and Vite provide the UI. Express keeps provider keys server-side and connects to Tavus. SQLite stores participants and sessions, OpenAI generates structured post-call reports, and Resend handles requested human follow-ups.
 
+![Personalized interview architecture and data flow](docs/personalized-interview-architecture.png)
+
 ## Data flow
 
 1. **Form to dynamic PAL:** The server sends the submitted name, situation, goals, and relevant prior-session brief to OpenAI for strict structured-output generation. The generated identity, greeting, conversational context, semantic casting profile, and objectives are validated, then merged with code-owned safety rules. Tavus creates an Objective set, a session-specific PAL, and a private conversation instead of using one fixed character.
