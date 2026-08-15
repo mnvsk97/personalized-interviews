@@ -9,6 +9,14 @@ export type GeneratedConfig = {
     style: string;
   };
   casting: { faceProfile: string; voiceProfile: string; language: string; pace: string };
+  personalization: {
+    summary: string;
+    knownFacts: string[];
+    locationContext: string;
+    conversationWarmers: string[];
+    currentSessionFocus: string[];
+    priorSessionUse: string;
+  };
   objectives: string[];
   guardrails: string[];
 };
@@ -23,8 +31,9 @@ export type SessionRecord = {
   config: GeneratedConfig;
   conversationId?: string;
   conversationUrl?: string;
+  palId?: string;
+  objectivesId?: string;
   summary?: string;
   result?: Record<string, unknown>;
   answers: Array<{ key: string; value: string; confirmed: boolean }>;
-  feedback: Array<{ rating: number; comment: string }>;
 };

@@ -5,11 +5,11 @@ import {
   CheckCircle2,
   CircleHelp,
   HeartHandshake,
+  Home as HomeIcon,
   LoaderCircle,
   MessageSquareText,
   ShieldCheck,
   Sparkles,
-  Star,
   Stethoscope,
   X,
 } from "lucide-react";
@@ -36,19 +36,19 @@ const modes = {
 
 const defaults: Record<Experience, FormValues> = {
   surrogacy: {
-    name: "",
-    email: "",
-    age: "",
-    location: "",
+    name: "Priya Sharma",
+    email: "demo.surrogacy@example.com",
+    age: "31",
+    location: "Austin, Texas",
     consent: false,
   },
   hcp: {
-    name: "",
-    email: "",
+    name: "Jordan Lee",
+    email: "demo.hcp@example.com",
     product: "Nuralis (fictional)",
     specialty: "Neurology",
     objective: "Earn agreement for a follow-up clinical discussion",
-    context: "",
+    context: "A first meeting after the physician asked for more information about access and tolerability.",
     challenge: "Evidence-focused and curious",
     difficulty: "Realistic",
     consent: false,
@@ -86,12 +86,10 @@ export default function Home() {
   const [config, setConfig] = useState<GeneratedConfig | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [rating, setRating] = useState(0);
-  const [comment, setComment] = useState("");
-  const [feedbackSent, setFeedbackSent] = useState(false);
   const [scorecardIncomplete, setScorecardIncomplete] = useState(false);
   const [reportPending, setReportPending] = useState(false);
   const ending = useRef(false);
+  const flowVersion = useRef(0);
 
   useEffect(() => {
     const parts = window.location.pathname.split("/").filter(Boolean);
@@ -111,6 +109,9 @@ export default function Home() {
         window.history.replaceState({}, "", routeFor(routedExperience, "setup"));
       });
     } else if (routedView === "conversation") {
+      if (sessionId) {
+        void request(`/api/sessions/${sessionId}/conversation`, { method: "DELETE", keepalive: true }).catch(() => undefined);
+      }
       setError("A live conversation cannot be resumed after a page reload. Start a new conversation.");
       window.history.replaceState({}, "", routeFor(routedExperience, "setup"));
     } else if (window.location.pathname === "/") {
@@ -182,6 +183,7 @@ export default function Home() {
   async function createSession(event: FormEvent) {
     event.preventDefault();
     if (!form.consent) return setError("Please confirm the synthetic-demo consent before continuing.");
+    const flow = ++flowVersion.current;
     setBusy(true);
     setError("");
     try {
@@ -189,21 +191,31 @@ export default function Home() {
         method: "POST",
         body: JSON.stringify({ experience, profile: form }),
       });
+      if (flow !== flowVersion.current) return;
       setConfig(created.config);
       const createdConversation = await request<TavusConversation>(`/api/sessions/${created.id}/conversation`, { method: "POST" });
+      if (flow !== flowVersion.current) {
+        void request(`/api/sessions/${created.id}/conversation`, {
+          method: "DELETE",
+          keepalive: true,
+          body: JSON.stringify({ conversationId: createdConversation.conversationId }),
+        }).catch(() => undefined);
+        return;
+      }
       setConversation(createdConversation);
       setSession({ ...created, status: "active", conversationId: createdConversation.conversationId, conversationUrl: createdConversation.conversationUrl || undefined });
       setView("call");
       window.history.pushState({}, "", routeFor(experience, "call", created.id));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not start the conversation.");
+      if (flow === flowVersion.current) setError(cause instanceof Error ? cause.message : "Could not start the conversation.");
     } finally {
-      setBusy(false);
+      if (flow === flowVersion.current) setBusy(false);
     }
   }
 
   async function finishCall() {
     if (!session || ending.current) return;
+    const flow = flowVersion.current;
     ending.current = true;
     setBusy(true);
     setError("");
@@ -214,18 +226,22 @@ export default function Home() {
       if (conversation) {
         await request(`/api/sessions/${session.id}/conversation`, {
           method: "DELETE",
-          body: JSON.stringify({ conversationId: conversation.conversationId, palId: conversation.palId }),
+          body: JSON.stringify({ conversationId: conversation.conversationId }),
         });
       }
+      if (flow !== flowVersion.current) return;
       const latest = await request<SessionRecord>(`/api/sessions/${session.id}`);
+      if (flow !== flowVersion.current) return;
       setSession(latest);
       setScorecardIncomplete(experience === "hcp" && latest.status !== "completed");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not finish the conversation.");
+      if (flow === flowVersion.current) setError(cause instanceof Error ? cause.message : "Could not finish the conversation.");
     } finally {
-      setReportPending(false);
-      setBusy(false);
-      ending.current = false;
+      if (flow === flowVersion.current) {
+        setReportPending(false);
+        setBusy(false);
+        ending.current = false;
+      }
     }
   }
 
@@ -233,42 +249,45 @@ export default function Home() {
     await finishCall();
   }
 
-  async function sendFeedback(event: FormEvent) {
-    event.preventDefault();
-    if (!session || !rating) return;
-    setBusy(true);
-    setError("");
-    try {
-      await request("/api/feedback", { method: "POST", body: JSON.stringify({ sessionId: session.id, rating, comment }) });
-      setFeedbackSent(true);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not save feedback.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   function reset() {
+    flowVersion.current += 1;
     setView("setup");
     setSession(null);
     setConversation(null);
     setConfig(null);
-    setRating(0);
-    setComment("");
-    setFeedbackSent(false);
+    setForm(defaults[experience]);
     setScorecardIncomplete(false);
     setReportPending(false);
+    setBusy(false);
     ending.current = false;
     setError("");
     window.history.pushState({}, "", routeFor(experience, "setup"));
   }
 
+  function goHome() {
+    const activeSession = view === "call" ? session : null;
+    const activeConversation = view === "call" ? conversation : null;
+    reset();
+    if (activeSession && activeConversation) {
+      void request(`/api/sessions/${activeSession.id}/conversation`, {
+        method: "DELETE",
+        keepalive: true,
+        body: JSON.stringify({ conversationId: activeConversation.conversationId }),
+      }).catch((cause) => {
+        setError(cause instanceof Error ? cause.message : "The screen was reset, but the remote conversation could not be cleaned up.");
+      });
+    }
+  }
+
   return (
     <main>
       <header className="site-header">
-        <button className="brand" onClick={reset} aria-label="Personalized Interviews home">
+        <button className="brand" onClick={goHome} aria-label="Personalized Interviews home">
           <span className="brand-mark" aria-hidden="true" />
           <span>Personalized Interviews</span>
+        </button>
+        <button className="home-button" onClick={goHome} aria-label="Restart from home">
+          <HomeIcon size={17} /> Home
         </button>
       </header>
 
@@ -377,7 +396,6 @@ export default function Home() {
                 {reportPracticePlan.length > 0 && <div className="coaching-note"><Sparkles /><div><strong>Practice plan</strong><ol>{reportPracticePlan.map((item) => <li key={item}>{item}</li>)}</ol></div></div>}
               </div>
             )}
-            <Feedback rating={rating} comment={comment} sent={feedbackSent} busy={busy} onRating={setRating} onComment={setComment} onSubmit={sendFeedback} />
             {error && <p className="error" role="alert"><CircleHelp size={17} />{error}</p>}
             <button className="secondary restart" onClick={reset}>Start another conversation <ArrowRight /></button>
           </section>
@@ -418,10 +436,4 @@ function Field({ label, name, value, onChange, placeholder, type = "text", wide,
 
 function Select({ label, name, value, onChange, options, placeholder, required }: { label: string; name: string; value: string | boolean; onChange: (name: string, value: string) => void; options: string[]; placeholder?: string; required?: boolean }) {
   return <label className="field"><span>{label}{required && <b> *</b>}</span><select id={name} name={name} value={String(value)} required={required} onChange={(event) => onChange(name, event.target.value)}>{placeholder && <option value="" disabled>{placeholder}</option>}{options.map((option) => <option key={option}>{option}</option>)}</select></label>;
-}
-
-function Feedback({ rating, comment, sent, busy, onRating, onComment, onSubmit }: { rating: number; comment: string; sent: boolean; busy: boolean; onRating: (n: number) => void; onComment: (s: string) => void; onSubmit: (e: FormEvent) => void }) {
-  return <form className="feedback panel" onSubmit={onSubmit}>
-    {sent ? <div className="thanks"><CheckCircle2 /><div><strong>Feedback saved</strong><p>Thanks for helping improve these conversations.</p></div></div> : <><div><p className="eyebrow">One last thing</p><h2>How useful was this experience?</h2></div><div className="stars" aria-label="Rating">{[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} onClick={() => onRating(value)} aria-label={`${value} star${value > 1 ? "s" : ""}`} aria-pressed={rating === value}><Star fill={value <= rating ? "currentColor" : "none"} /></button>)}</div><label className="field"><span>Anything we should improve?</span><textarea value={comment} onChange={(event) => onComment(event.target.value)} rows={2} placeholder="Optional feedback" /></label><button className="primary" disabled={!rating || busy}>Send feedback <ArrowRight /></button></>}
-  </form>;
 }

@@ -14,10 +14,18 @@ type SessionRow = {
   config: string;
   conversation_id: string | null;
   conversation_url: string | null;
+  pal_id: string | null;
+  objectives_id: string | null;
   summary: string | null;
   result: string | null;
   created_at: string;
   updated_at: string;
+};
+
+type Participant = {
+  id: string;
+  email: string;
+  displayName: string;
 };
 
 let database: Database.Database | undefined;
@@ -57,6 +65,8 @@ function openDatabase() {
       config TEXT NOT NULL,
       conversation_id TEXT,
       conversation_url TEXT,
+      pal_id TEXT,
+      objectives_id TEXT,
       summary TEXT,
       result TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -82,13 +92,6 @@ function openDatabase() {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(session_id, key)
     );
-    CREATE TABLE IF NOT EXISTS feedback (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-      comment TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
     CREATE TABLE IF NOT EXISTS callback_requests (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -100,20 +103,13 @@ function openDatabase() {
       email_id TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-    CREATE TABLE IF NOT EXISTS tool_activity (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      external_event_id TEXT,
-      phase TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      tool_name TEXT,
-      payload TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
   `);
+  database.exec("DROP TABLE IF EXISTS feedback");
   const sessionColumns = new Set((database.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map(({ name }) => name));
   if (!sessionColumns.has("participant_id")) database.exec("ALTER TABLE sessions ADD COLUMN participant_id TEXT REFERENCES participants(id)");
   if (!sessionColumns.has("previous_session_id")) database.exec("ALTER TABLE sessions ADD COLUMN previous_session_id TEXT REFERENCES sessions(id)");
+  if (!sessionColumns.has("pal_id")) database.exec("ALTER TABLE sessions ADD COLUMN pal_id TEXT");
+  if (!sessionColumns.has("objectives_id")) database.exec("ALTER TABLE sessions ADD COLUMN objectives_id TEXT");
   database.exec(`
     CREATE INDEX IF NOT EXISTS sessions_participant_experience_idx ON sessions(participant_id, experience, created_at);
   `);
@@ -129,15 +125,35 @@ function looksLikeEmail(email: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-function upsertParticipantRow(db: Database.Database, input: { id: string; email: string; displayName?: string }) {
+function findParticipant(db: Database.Database, email: string) {
+  return db.prepare(`
+    SELECT id, email_normalized AS email, display_name AS displayName
+    FROM participants
+    WHERE email_normalized = ?
+  `).get(email) as Participant | undefined;
+}
+
+function getOrCreateParticipant(db: Database.Database, input: { id: string; email: string; displayName?: string }) {
   const email = normalizeEmail(input.email);
-  db.prepare(`INSERT INTO participants (id, email_normalized, display_name) VALUES (?, ?, ?)
-    ON CONFLICT(email_normalized) DO UPDATE SET
-      display_name = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE participants.display_name END,
-      updated_at = CURRENT_TIMESTAMP`)
-    .run(input.id, email, input.displayName?.trim() || "");
-  return db.prepare("SELECT id, email_normalized AS email, display_name AS displayName FROM participants WHERE email_normalized = ?")
-    .get(email) as { id: string; email: string; displayName: string };
+  const displayName = input.displayName?.trim() || "";
+  const existing = findParticipant(db, email);
+
+  if (existing) {
+    db.prepare(`
+      UPDATE participants
+      SET display_name = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(displayName || existing.displayName, existing.id);
+
+    return { ...existing, displayName: displayName || existing.displayName };
+  }
+
+  db.prepare(`
+    INSERT INTO participants (id, email_normalized, display_name)
+    VALUES (?, ?, ?)
+  `).run(input.id, email, displayName);
+
+  return { id: input.id, email, displayName };
 }
 
 function backfillParticipants(db: Database.Database) {
@@ -149,7 +165,11 @@ function backfillParticipants(db: Database.Database) {
       if (typeof profile.email !== "string") continue;
       const email = normalizeEmail(profile.email);
       if (!looksLikeEmail(email)) continue;
-      const participant = upsertParticipantRow(db, { id: randomUUID(), email, displayName: typeof profile.name === "string" ? profile.name : "" });
+      const participant = getOrCreateParticipant(db, {
+        id: randomUUID(),
+        email,
+        displayName: typeof profile.name === "string" ? profile.name : "",
+      });
       update.run(participant.id, row.id);
     }
   });
@@ -159,7 +179,6 @@ function backfillParticipants(db: Database.Database) {
 function hydrate(row: SessionRow): SessionRecord {
   const db = openDatabase();
   const answers = db.prepare("SELECT key, value, confirmed FROM answers WHERE session_id = ? ORDER BY id").all(row.id) as Array<{ key: string; value: string; confirmed: number }>;
-  const feedback = db.prepare("SELECT rating, comment FROM feedback WHERE session_id = ? ORDER BY id").all(row.id) as Array<{ rating: number; comment: string }>;
   return {
     id: row.id,
     ...(row.participant_id ? { participantId: row.participant_id } : {}),
@@ -170,10 +189,11 @@ function hydrate(row: SessionRow): SessionRecord {
     config: json<GeneratedConfig>(row.config, {} as GeneratedConfig),
     ...(row.conversation_id ? { conversationId: row.conversation_id } : {}),
     ...(row.conversation_url ? { conversationUrl: row.conversation_url } : {}),
+    ...(row.pal_id ? { palId: row.pal_id } : {}),
+    ...(row.objectives_id ? { objectivesId: row.objectives_id } : {}),
     ...(row.summary ? { summary: row.summary } : {}),
     ...(row.result ? { result: json(row.result, {}) } : {}),
     answers: answers.map((answer) => ({ ...answer, confirmed: Boolean(answer.confirmed) })),
-    feedback,
   };
 }
 
@@ -184,19 +204,46 @@ export function createSession(input: { id: string; participantId?: string; previ
 }
 
 export function upsertParticipant(input: { id: string; email: string; displayName?: string }) {
-  return upsertParticipantRow(openDatabase(), input);
+  return getOrCreateParticipant(openDatabase(), input);
 }
 
-export function getLatestCompletedSession(participantId: string, experience: Experience) {
-  const row = openDatabase().prepare(`SELECT * FROM sessions
-    WHERE participant_id = ? AND experience = ? AND status IN ('completed', 'escalated')
-    ORDER BY updated_at DESC, rowid DESC LIMIT 1`).get(participantId, experience) as SessionRow | undefined;
+export function getLatestReusableSession(participantId: string, experience: Experience) {
+  const row = openDatabase().prepare(`
+    SELECT s.*
+    FROM sessions s
+    WHERE s.participant_id = ?
+      AND s.experience = ?
+      AND (
+        s.status IN ('completed', 'escalated')
+        OR EXISTS (
+          SELECT 1 FROM answers a
+          WHERE a.session_id = s.id AND a.confirmed = 1
+        )
+      )
+    ORDER BY s.updated_at DESC, s.rowid DESC
+    LIMIT 1
+  `).get(participantId, experience) as SessionRow | undefined;
+
   return row ? hydrate(row) : undefined;
 }
 
+export function getConfirmedParticipantAnswers(participantId: string, experience: Experience) {
+  const rows = openDatabase().prepare(`
+    SELECT a.key, a.value
+    FROM answers a
+    JOIN sessions s ON s.id = a.session_id
+    WHERE s.participant_id = ?
+      AND s.experience = ?
+      AND a.confirmed = 1
+    ORDER BY a.updated_at DESC, a.id DESC
+  `).all(participantId, experience) as Array<{ key: string; value: string }>;
+  const latest = new Map<string, string>();
+  for (const answer of rows) if (!latest.has(answer.key)) latest.set(answer.key, answer.value);
+  return [...latest].map(([key, value]) => ({ key, value, confirmed: true as const }));
+}
+
 export function getParticipantByEmail(email: string) {
-  return openDatabase().prepare("SELECT id, email_normalized AS email, display_name AS displayName FROM participants WHERE email_normalized = ?")
-    .get(normalizeEmail(email)) as { id: string; email: string; displayName: string } | undefined;
+  return findParticipant(openDatabase(), normalizeEmail(email));
 }
 
 export function getSession(id: string) {
@@ -204,13 +251,15 @@ export function getSession(id: string) {
   return row ? hydrate(row) : undefined;
 }
 
-export function updateSession(id: string, patch: { status?: string; conversationId?: string; conversationUrl?: string; summary?: string; result?: Record<string, unknown> }) {
+export function updateSession(id: string, patch: { status?: string; conversationId?: string; conversationUrl?: string; palId?: string; objectivesId?: string; summary?: string; result?: Record<string, unknown> }) {
   const current = getSession(id);
   if (!current) return undefined;
-  openDatabase().prepare(`UPDATE sessions SET status = ?, conversation_id = ?, conversation_url = ?, summary = ?, result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
+  openDatabase().prepare(`UPDATE sessions SET status = ?, conversation_id = ?, conversation_url = ?, pal_id = ?, objectives_id = ?, summary = ?, result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
     patch.status ?? current.status,
     patch.conversationId ?? current.conversationId ?? null,
     patch.conversationUrl ?? current.conversationUrl ?? null,
+    patch.palId ?? current.palId ?? null,
+    patch.objectivesId ?? current.objectivesId ?? null,
     patch.summary ?? current.summary ?? null,
     patch.result ? JSON.stringify(patch.result) : current.result ? JSON.stringify(current.result) : null,
     id,
@@ -224,10 +273,6 @@ export function saveAnswer(sessionId: string, key: string, value: string, confir
     .run(sessionId, key, value, confirmed ? 1 : 0);
 }
 
-export function saveFeedback(sessionId: string, rating: number, comment: string) {
-  return openDatabase().prepare("INSERT INTO feedback (session_id, rating, comment) VALUES (?, ?, ?)").run(sessionId, rating, comment).lastInsertRowid;
-}
-
 export function saveCallbackRequest(input: { id: string; sessionId: string; phone: string; preferredTime: string; reason: string; candidateMessage: string }) {
   openDatabase().prepare("INSERT INTO callback_requests (id, session_id, phone, preferred_time, reason, candidate_message) VALUES (?, ?, ?, ?, ?, ?)")
     .run(input.id, input.sessionId, input.phone, input.preferredTime, input.reason, input.candidateMessage);
@@ -235,14 +280,6 @@ export function saveCallbackRequest(input: { id: string; sessionId: string; phon
 
 export function updateCallbackEmail(id: string, status: "sent" | "pending_email", emailId?: string) {
   openDatabase().prepare("UPDATE callback_requests SET email_status = ?, email_id = ? WHERE id = ?").run(status, emailId ?? null, id);
-}
-
-export function feedbackSummary(experience?: Experience) {
-  const filter = experience ? "WHERE s.experience = ?" : "";
-  const params = experience ? [experience] : [];
-  const stats = openDatabase().prepare(`SELECT COUNT(*) AS count, ROUND(AVG(f.rating), 2) AS averageRating FROM feedback f JOIN sessions s ON s.id = f.session_id ${filter}`).get(...params) as { count: number; averageRating: number | null };
-  const recent = openDatabase().prepare(`SELECT f.rating, f.comment, f.created_at AS createdAt, s.experience FROM feedback f JOIN sessions s ON s.id = f.session_id ${filter} ORDER BY f.id DESC LIMIT 20`).all(...params);
-  return { count: stats.count, averageRating: stats.averageRating, recent };
 }
 
 export function findEvent(sessionId: string, externalEventId: string) {
@@ -253,17 +290,6 @@ export function findEvent(sessionId: string, externalEventId: string) {
 export function saveEvent(input: { sessionId: string; externalEventId: string; name: string; arguments: unknown; result: unknown }) {
   openDatabase().prepare("INSERT INTO events (session_id, external_event_id, name, arguments, result) VALUES (?, ?, ?, ?, ?)")
     .run(input.sessionId, input.externalEventId, input.name, JSON.stringify(input.arguments), JSON.stringify(input.result));
-}
-
-export function saveToolActivity(input: { sessionId: string; externalEventId?: string; phase: string; eventType: string; toolName?: string; payload?: unknown }) {
-  return openDatabase().prepare("INSERT INTO tool_activity (session_id, external_event_id, phase, event_type, tool_name, payload) VALUES (?, ?, ?, ?, ?, ?)")
-    .run(input.sessionId, input.externalEventId ?? null, input.phase, input.eventType, input.toolName ?? null, JSON.stringify(input.payload ?? {})).lastInsertRowid;
-}
-
-export function getToolActivity(sessionId: string) {
-  const rows = openDatabase().prepare(`SELECT external_event_id AS externalEventId, phase, event_type AS eventType, tool_name AS toolName, payload, created_at AS createdAt
-    FROM tool_activity WHERE session_id = ? ORDER BY id`).all(sessionId) as Array<{ externalEventId: string | null; phase: string; eventType: string; toolName: string | null; payload: string; createdAt: string }>;
-  return rows.map((row) => ({ ...row, payload: json<Record<string, unknown>>(row.payload, {}) }));
 }
 
 export function runTransaction<T>(fn: () => T): T {

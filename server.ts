@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import express from "express";
 import { Resend } from "resend";
 import { z } from "zod";
-import { createSession, feedbackSummary, findEvent, getLatestCompletedSession, getSession, getToolActivity, normalizeEmail, runTransaction, saveAnswer, saveCallbackRequest, saveEvent, saveFeedback, saveToolActivity, updateCallbackEmail, updateSession, upsertParticipant } from "./lib/db";
+import { createSession, findEvent, getConfirmedParticipantAnswers, getLatestReusableSession, getSession, normalizeEmail, runTransaction, saveAnswer, saveCallbackRequest, saveEvent, updateCallbackEmail, updateSession, upsertParticipant } from "./lib/db";
 import { generateConfig } from "./lib/generate-config";
 import { generateHcpReport } from "./lib/generate-hcp-report";
 import { generateSurrogacyReport } from "./lib/generate-surrogacy-report";
@@ -19,17 +19,8 @@ const sessionInput = z.object({ experience: z.enum(["surrogacy", "hcp"]), profil
   .superRefine(({ profile }, context) => {
     if (!emailInput.safeParse(profile.email).success) context.addIssue({ code: z.ZodIssueCode.custom, path: ["profile", "email"], message: "A valid email is required" });
   });
-const sessionPatch = z.object({ status: z.literal("active").optional(), conversationId: z.string().min(1).max(200).optional(), conversationUrl: z.string().url().optional() }).strict();
 const toolNames = ["save_interview_answer", "request_human_callback", "complete_prescreen", "record_hcp_objection", "complete_hcp_practice"] as const;
 const toolInput = z.object({ sessionId: z.string().uuid(), name: z.enum(toolNames), arguments: z.record(z.string(), z.unknown()).default({}), externalEventId: z.string().min(1).max(200) });
-const toolActivityInput = z.object({
-  sessionId: z.string().uuid(),
-  externalEventId: z.string().min(1).max(200).optional(),
-  phase: z.enum(["client_received", "client_ignored", "client_result_sent"]),
-  eventType: z.string().min(1).max(200),
-  toolName: z.string().min(1).max(200).optional(),
-  payload: z.record(z.string(), z.unknown()).default({}),
-}).strict();
 const toolArgs = {
   save_interview_answer: z.object({ key: z.enum(surrogacyAnswerKeys), value: z.string().trim().min(1).max(4000), confirmed: z.boolean() }).strict(),
   request_human_callback: z.object({ phone: z.string().trim().min(7).max(30), preferredTime: z.string().trim().min(1).max(200), reason: z.string().trim().min(1).max(1000), candidateMessage: z.string().trim().min(1).max(2000) }).strict(),
@@ -45,7 +36,6 @@ const toolArgs = {
   }).strict(),
 };
 const allowedTools = { surrogacy: new Set(["save_interview_answer", "request_human_callback", "complete_prescreen"]), hcp: new Set(["record_hcp_objection", "complete_hcp_practice"]) };
-const feedbackInput = z.object({ sessionId: z.string().uuid(), rating: z.number().int().min(1).max(5), comment: z.string().trim().max(4000).default("") });
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : "Request failed";
@@ -68,7 +58,7 @@ function buildNextSessionBrief(experience: "surrogacy" | "hcp", summary: string 
   const capturedDetails = Array.isArray(result.capturedDetails) ? result.capturedDetails.flatMap((item) => {
     if (!item || typeof item !== "object") return [];
     const detail = item as { label?: unknown; value?: unknown };
-    return typeof detail.label === "string" && typeof detail.value === "string" ? [{ label: detail.label, value: detail.value }] : [];
+    return typeof detail.label === "string" && typeof detail.value === "string" ? [{ label: detail.label, value: detail.value, ...(typeof (detail as { source?: unknown }).source === "string" ? { source: (detail as { source: string }).source } : {}) }] : [];
   }).slice(0, 20) : [];
   return {
     summary: summary || (typeof result.summary === "string" ? result.summary : ""),
@@ -78,11 +68,34 @@ function buildNextSessionBrief(experience: "surrogacy" | "hcp", summary: string 
   };
 }
 
-function storedOrDerivedBrief(session: ReturnType<typeof getSession>) {
+function storedOrDerivedBrief(session: ReturnType<typeof getSession>, participantAnswers: Array<{ key: string; value: string; confirmed: boolean }> = []) {
   if (!session) return undefined;
   const stored = session.result?.nextSessionBrief;
-  if (stored && typeof stored === "object" && !Array.isArray(stored)) return stored as Record<string, unknown>;
-  return buildNextSessionBrief(session.experience, session.summary, session.result || {});
+  const base = stored && typeof stored === "object" && !Array.isArray(stored)
+    ? stored as Record<string, unknown>
+    : buildNextSessionBrief(session.experience, session.summary, session.result || {});
+  const answers = participantAnswers.length ? participantAnswers : session.answers;
+  if (session.experience === "hcp") {
+    const objectionHistory = answers.flatMap((answer) => {
+      if (!answer.confirmed || !answer.key.startsWith("objection:")) return [];
+      try {
+        const parsed = JSON.parse(answer.value) as { objection?: unknown; response?: unknown; outcome?: unknown };
+        if (typeof parsed.objection !== "string" || typeof parsed.response !== "string") return [];
+        return [{ objection: parsed.objection, response: parsed.response, ...(typeof parsed.outcome === "string" && parsed.outcome ? { outcome: parsed.outcome } : {}) }];
+      } catch {
+        return [];
+      }
+    }).slice(0, 8);
+    return { ...base, objectionHistory };
+  }
+  const details = Array.isArray(base.capturedDetails) ? base.capturedDetails.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
+  const merged = new Map(details.flatMap((item) => typeof item.label === "string" ? [[item.label.toLowerCase(), item] as const] : []));
+  for (const answer of answers) {
+    if (!answer.confirmed) continue;
+    const label = answer.key.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+    merged.set(label.toLowerCase(), { label, value: answer.value, source: "confirmed_answer" });
+  }
+  return { ...base, capturedDetails: [...merged.values()] };
 }
 
 async function executeTool(sessionId: string, name: keyof typeof toolArgs, raw: Record<string, unknown>, externalEventId: string) {
@@ -130,8 +143,15 @@ async function executeTool(sessionId: string, name: keyof typeof toolArgs, raw: 
   return { completed: true, weightedScore };
 }
 
-export function createApp() {
+export function createApp(dependencies: {
+  configGenerator?: typeof generateConfig;
+  tavusSessionCreator?: typeof createTavusSession;
+  tavusSessionEnder?: typeof endTavusSession;
+} = {}) {
   const app = express();
+  const configGenerator = dependencies.configGenerator || generateConfig;
+  const tavusSessionCreator = dependencies.tavusSessionCreator || createTavusSession;
+  const tavusSessionEnder = dependencies.tavusSessionEnder || endTavusSession;
   app.use(express.json({ limit: "1mb" }));
 
   app.post("/api/sessions", async (req, res) => {
@@ -139,10 +159,17 @@ export function createApp() {
     if (!input.success) return res.status(400).json({ error: "Invalid session", details: input.error.flatten() });
     try {
       const email = normalizeEmail(emailInput.parse(input.data.profile.email));
-      const profile: Record<string, unknown> = { ...input.data.profile, email };
-      const participant = upsertParticipant({ id: randomUUID(), email, displayName: typeof profile.name === "string" ? profile.name : "" });
-      const previous = getLatestCompletedSession(participant.id, input.data.experience);
-      const config = await generateConfig(input.data.experience, profile, storedOrDerivedBrief(previous));
+      const submittedProfile: Record<string, unknown> = { ...input.data.profile, email };
+      const participant = upsertParticipant({ id: randomUUID(), email, displayName: typeof submittedProfile.name === "string" ? submittedProfile.name : "" });
+      const previous = getLatestReusableSession(participant.id, input.data.experience);
+      const participantAnswers = getConfirmedParticipantAnswers(participant.id, input.data.experience);
+      const profile = { ...submittedProfile };
+      if (input.data.experience === "surrogacy") {
+        for (const answer of participantAnswers) {
+          if (answer.key === "name" || answer.key === "age" || answer.key === "location") profile[answer.key] = answer.value;
+        }
+      }
+      const config = await configGenerator(input.data.experience, profile, storedOrDerivedBrief(previous, participantAnswers));
       return res.status(201).json({ session: createSession({ id: randomUUID(), participantId: participant.id, previousSessionId: previous?.id, experience: input.data.experience, profile, config }) });
     } catch (error) { return res.status(500).json({ error: errorText(error) }); }
   });
@@ -152,25 +179,25 @@ export function createApp() {
     return session ? res.json({ session }) : res.status(404).json({ error: "Session not found" });
   });
 
-  app.patch("/api/sessions/:id", (req, res) => {
-    const current = getSession(req.params.id);
-    if (!current) return res.status(404).json({ error: "Session not found" });
-    const input = sessionPatch.safeParse(req.body);
-    if (!input.success) return res.status(400).json({ error: "Invalid session update", details: input.error.flatten() });
-    if (input.data.status && input.data.status !== current.status && !(current.status === "created" && input.data.status === "active")) return res.status(409).json({ error: `Invalid status transition: ${current.status} -> ${input.data.status}` });
-    return res.json({ session: updateSession(current.id, input.data) });
-  });
-
   app.post("/api/sessions/:id/conversation", async (req, res) => {
     const session = getSession(req.params.id);
     if (!session) return res.status(404).json({ error: "Session not found" });
     if (session.status !== "created") return res.status(409).json({ error: "Conversation already started" });
     try {
-      const conversationProfile = { ...session.profile };
-      delete conversationProfile.email;
-      const conversation = await createTavusSession(session.id, session.config, conversationProfile, session.experience, session.participantId);
-      updateSession(session.id, { status: "active", conversationId: conversation.conversationId, conversationUrl: conversation.conversationUrl });
-      return res.json({ conversation });
+      const conversation = await tavusSessionCreator(session.config, session.experience, session.participantId);
+      updateSession(session.id, {
+        status: "active",
+        conversationId: conversation.conversationId,
+        conversationUrl: conversation.conversationUrl,
+        palId: conversation.palId,
+        objectivesId: conversation.objectivesId,
+      });
+      return res.json({ conversation: {
+        mode: conversation.mode,
+        conversationId: conversation.conversationId,
+        conversationUrl: conversation.conversationUrl,
+        meetingToken: conversation.meetingToken,
+      } });
     } catch (error) { return res.status(502).json({ error: errorText(error) }); }
   });
 
@@ -179,7 +206,7 @@ export function createApp() {
     if (!session) return res.status(404).json({ error: "Session not found" });
     const conversationId = req.body?.conversationId || session.conversationId;
     if (!conversationId || (session.conversationId && conversationId !== session.conversationId)) return res.status(400).json({ error: "Conversation does not match this session" });
-    const transcript = await endTavusSession(conversationId, req.body?.palId, true);
+    const transcript = await tavusSessionEnder(conversationId, session.palId, true, session.objectivesId);
     try {
       if (session.experience === "surrogacy") {
         const latest = getSession(session.id) || session;
@@ -211,55 +238,24 @@ export function createApp() {
     if (replay) return res.json({ ok: true, data: replay, replayed: true });
     const session = getSession(sessionId);
     if (!session) return res.status(404).json({ error: "Session not found" });
-    saveToolActivity({ sessionId, externalEventId, phase: "backend_received", eventType: "conversation.tool_call", toolName: name, payload: raw });
     const allowedAfterCompletion = session.experience === "surrogacy" && (name === "save_interview_answer" || name === "request_human_callback");
     if (session.status === "escalated" || (session.status === "completed" && !allowedAfterCompletion)) {
-      saveToolActivity({ sessionId, externalEventId, phase: "backend_rejected", eventType: "conversation.tool_result", toolName: name, payload: { error: "Session is closed" } });
       return res.status(409).json({ error: "Session is closed" });
     }
     if (!allowedTools[session.experience].has(name)) {
       const error = `Tool ${name} is not allowed for ${session.experience}`;
-      saveToolActivity({ sessionId, externalEventId, phase: "backend_rejected", eventType: "conversation.tool_result", toolName: name, payload: { error } });
       return res.status(403).json({ error });
     }
     try {
       const data = await executeTool(sessionId, name, raw, externalEventId);
       runTransaction(() => saveEvent({ sessionId, externalEventId, name, arguments: raw, result: data }));
-      saveToolActivity({ sessionId, externalEventId, phase: "backend_completed", eventType: "conversation.tool_result", toolName: name, payload: data });
       return res.json({ ok: true, data, replayed: false });
     } catch (error) {
-      saveToolActivity({ sessionId, externalEventId, phase: "backend_rejected", eventType: "conversation.tool_result", toolName: name, payload: { error: errorText(error) } });
       if (error instanceof z.ZodError) return res.status(400).json({ error: "Invalid tool arguments", details: error.flatten() });
       return res.status(409).json({ error: errorText(error) });
     }
   });
 
-  app.post("/api/tool-activity", (req, res) => {
-    const input = toolActivityInput.safeParse(req.body);
-    if (!input.success) return res.status(400).json({ error: "Invalid tool activity", details: input.error.flatten() });
-    if (!getSession(input.data.sessionId)) return res.status(404).json({ error: "Session not found" });
-    const id = saveToolActivity(input.data);
-    return res.status(201).json({ activity: { id } });
-  });
-
-  app.get("/api/sessions/:id/tool-activity", (req, res) => {
-    if (!getSession(req.params.id)) return res.status(404).json({ error: "Session not found" });
-    return res.json({ activity: getToolActivity(req.params.id) });
-  });
-
-  app.post("/api/feedback", (req, res) => {
-    const input = feedbackInput.safeParse(req.body);
-    if (!input.success) return res.status(400).json({ error: "Invalid feedback", details: input.error.flatten() });
-    if (!getSession(input.data.sessionId)) return res.status(404).json({ error: "Session not found" });
-    const id = saveFeedback(input.data.sessionId, input.data.rating, input.data.comment);
-    return res.status(201).json({ feedback: { id, ...input.data } });
-  });
-
-  app.get("/api/feedback", (req, res) => {
-    const experience = typeof req.query.experience === "string" ? req.query.experience : undefined;
-    if (experience && experience !== "surrogacy" && experience !== "hcp") return res.status(400).json({ error: "Invalid experience" });
-    return res.json(feedbackSummary(experience as "surrogacy" | "hcp" | undefined));
-  });
   return app;
 }
 

@@ -5,7 +5,6 @@ type Conversation = {
   conversationId: string;
   conversationUrl: string;
   meetingToken: string;
-  palId: string;
 };
 
 type CallFrame = {
@@ -52,14 +51,6 @@ export function TavusRoom({ sessionId, conversation, onLeave }: { sessionId: str
     onLeaveRef.current = onLeave;
   }, [onLeave]);
 
-  const logActivity = useCallback((input: { phase: "client_received" | "client_ignored" | "client_result_sent"; eventType: string; externalEventId?: string; toolName?: string; payload?: Record<string, unknown> }) => {
-    void fetch("/api/tool-activity", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, ...input }),
-    }).catch(() => undefined);
-  }, [sessionId]);
-
   const handleMessage = useCallback(async (event: unknown, frame: CallFrame) => {
     const envelope = event as { data?: ToolMessage };
     const message = (envelope.data || event) as ToolMessage;
@@ -67,19 +58,9 @@ export function TavusRoom({ sessionId, conversation, onLeave }: { sessionId: str
     if (message.message_type !== "conversation" || message.event_type !== "conversation.tool_call") return;
     const toolName = properties?.name;
     const eventId = properties?.tool_call_id;
-    logActivity({
-      phase: toolName && eventId ? "client_received" : "client_ignored",
-      eventType: message.event_type,
-      ...(eventId ? { externalEventId: eventId } : {}),
-      ...(toolName ? { toolName } : {}),
-      payload: { conversationId: message.conversation_id || "", seq: message.seq ?? -1, arguments: properties?.arguments ?? {} },
-    });
     if (!toolName || !eventId) return;
     if (message.conversation_id && message.conversation_id !== conversation.conversationId) return;
-    if (!allowedTools.has(toolName)) {
-      logActivity({ phase: "client_ignored", eventType: message.event_type, externalEventId: eventId, toolName, payload: { reason: "Tool is not allowed by the client" } });
-      return;
-    }
+    if (!allowedTools.has(toolName)) return;
 
     if (handled.current.has(eventId)) return;
     handled.current.add(eventId);
@@ -112,9 +93,8 @@ export function TavusRoom({ sessionId, conversation, onLeave }: { sessionId: str
       ok,
       ok ? (result.data ?? { saved: true }) : { error: String(result.error || "invalid request") },
     ), "*");
-    logActivity({ phase: "client_result_sent", eventType: "conversation.tool_result", externalEventId: eventId, toolName, payload: { status: ok ? "success" : "error" } });
     setStatus(ok ? "Saved — continuing interview" : "Needs clarification before saving");
-  }, [conversation.conversationId, logActivity, sessionId]);
+  }, [conversation.conversationId, sessionId]);
 
   useEffect(() => {
     if (!container.current) return;
@@ -129,7 +109,9 @@ export function TavusRoom({ sessionId, conversation, onLeave }: { sessionId: str
       }) as CallFrame;
       call.current = frame;
       frame.on("joined-meeting", () => setStatus("Connected"));
-      frame.on("left-meeting", () => onLeaveRef.current?.());
+      frame.on("left-meeting", () => {
+        if (active) onLeaveRef.current?.();
+      });
       frame.on("error", () => setStatus("The video room could not connect"));
       frame.on("app-message", (event) => void handleMessage(event, frame));
       await frame.join({ url: conversation.conversationUrl!, token: conversation.meetingToken! });
