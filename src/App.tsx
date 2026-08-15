@@ -302,12 +302,6 @@ export default function Home() {
 
         {view === "setup" && (
           <>
-            <section className="hero">
-              <p className="eyebrow">Practice with purpose</p>
-              <h1>Prepare for a conversation that matters.</h1>
-              <p>Share the context, then begin a focused role-play built around your answers.</p>
-            </section>
-
             <section className="mode-grid" aria-label="Choose an experience">
               {(Object.keys(modes) as Experience[]).map((mode) => {
                 const item = modes[mode];
