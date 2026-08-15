@@ -333,7 +333,7 @@ const tavusConfig: GeneratedConfig = {
   pal: { name: "Maya", role: "coach", systemPrompt: "Run a respectful interview.", greeting: "Hello", style: "warm" },
   casting: { faceProfile: "warm professional anna", voiceProfile: "calm anna", language: "English", pace: "patient" },
   personalization: { summary: "A respectful interview", knownFacts: [], locationContext: "", conversationWarmers: ["Open warmly"], currentSessionFocus: ["Collect confirmed answers"], priorSessionUse: "" },
-  objectives: ["Collect confirmed answers"], guardrails: ["Do not diagnose"],
+  objectives: ["Collect confirmed answers", "Finish the intake"], guardrails: ["Do not diagnose"],
 };
 
 describe("Tavus integration", () => {
@@ -444,7 +444,10 @@ describe("Tavus integration", () => {
     vi.stubGlobal("fetch", fetch);
     await expect(createTavusSession(tavusConfig, "hcp", "participant-123")).resolves.toMatchObject({ conversationId: "conv-1", meetingToken: "private-token", objectivesId: "objectives-1" });
     const objectives = bodies.find(({ url }) => url.endsWith("/objectives"))!.body;
-    expect(objectives.data).toEqual([{ objective_name: "session_objective_1", objective_prompt: "Collect confirmed answers", confirmation_mode: "auto", modality: "verbal" }]);
+    expect(objectives.data).toEqual([
+      { objective_name: "session_objective_1", objective_prompt: "Collect confirmed answers", confirmation_mode: "auto", modality: "verbal", next_required_objective: "session_objective_2" },
+      { objective_name: "session_objective_2", objective_prompt: "Finish the intake", confirmation_mode: "auto", modality: "verbal" },
+    ]);
     const pal = bodies.find(({ url }) => url.endsWith("/pals"))!.body;
     expect(pal).toMatchObject({ pal_name: "Maya", default_face_id: "face-anna", objectives_id: "objectives-1", disclosure_type: "off" });
     expect(String(pal.pal_name)).not.toContain("12345678");

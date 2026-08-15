@@ -274,6 +274,9 @@ export async function createTavusSession(config: GeneratedConfig, experience?: "
         objective_prompt: objective,
         confirmation_mode: "auto",
         modality: "verbal",
+        ...(index < config.objectives.length - 1
+          ? { next_required_objective: `session_objective_${index + 2}` }
+          : {}),
       })),
     }),
   });
